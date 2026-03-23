@@ -1,0 +1,429 @@
+# brosdk-sdk
+
+> BroSDK 的 TypeScript / Node.js 封装，通过 [koffi](https://koffi.dev/) 调用原生动态库（Windows `.dll` / macOS `.dylib`），专为 Electron 主进程设计。
+
+---
+
+## 目录
+
+- [环境要求](#环境要求)
+- [安装](#安装)
+- [动态库放置](#动态库放置)
+- [快速上手](#快速上手)
+- [在 Electron IPC 中使用](#在-electron-ipc-中使用)
+- [API 参考](#api-参考)
+- [错误码工具](#错误码工具)
+- [事件回调](#事件回调)
+- [注意事项](#注意事项)
+
+---
+
+## 环境要求
+
+| 项目 | 要求 |
+|------|------|
+| Node.js | ≥ 18.0.0 |
+| Electron | ≥ 20.0.0 |
+| 平台 | Windows x64 / arm64，macOS x64 / arm64 |
+
+---
+
+## 安装
+
+```bash
+npm install brosdk-sdk
+```
+
+`koffi` 是运行时依赖，会随包自动安装。`electron` 由宿主应用提供，无需重复安装。
+
+---
+
+## 动态库放置
+
+SDK 会在以下路径自动寻找原生库，**请按平台将对应目录放入项目**：
+
+```
+项目根目录/
+└── sdk/
+    ├── windows-x64/
+    │   └── brosdk.dll        # Windows x64
+    ├── arm64-windows/
+    │   └── brosdk.dll        # Windows arm64
+    ├── x64-osx/
+    │   └── brosdk.dylib      # macOS x64
+    └── arm64-osx/
+        └── brosdk.dylib      # macOS arm64
+```
+
+- **开发阶段**：路径基于 `app.getAppPath()/sdk/...`
+- **打包后**：路径基于 `process.resourcesPath/sdk/...`
+
+---
+
+## 快速上手
+
+```typescript
+import BroSDK from 'brosdk-sdk'
+
+const sdk = new BroSDK()
+
+// 注册结果回调（异步操作的结果都通过此回调返回）
+sdk.registerResultCb((code, data) => {
+  console.log('SDK 回调', code, data)
+})
+
+// 注册 Cookie 持久化回调（可选）
+sdk.registerCookiesStorageCb((cookies) => {
+  console.log('收到 cookies', cookies)
+  return null  // 返回 null 表示不修改，直接透传
+})
+
+// 同步初始化
+const result = sdk.init({ port: 65535, userSig: 'your-user-sig' })
+if (result.code === 0) {
+  console.log('初始化成功', result.response)
+} else {
+  sdk.printErrno('init', result.code)
+}
+
+// 使用完毕后释放资源
+sdk.shutdown()
+```
+
+---
+
+## 在 Electron IPC 中使用
+
+以下示例展示了如何将 `BroSDK` 封装为一个 IPC 服务类，在 Electron 主进程中响应渲染进程的调用：
+
+```typescript
+import { ipcMain } from 'electron'
+import BroSDK from 'brosdk-sdk'
+
+interface IResponse {
+  code: number
+  msg: string
+}
+
+export default class SDK {
+  private bindStatus = false
+  private broSDK: BroSDK
+
+  constructor() {
+    this.broSDK = new BroSDK()
+
+    ipcMain.handle('app-bind',          this.init)
+    ipcMain.handle('app-token-update',  this.tokenUpdate)
+    ipcMain.handle('app-browser-open',  this.browserOpen)
+    ipcMain.handle('app-browser-close', this.browserClose)
+    ipcMain.handle('app-shutdown',      this.shutdown)
+  }
+
+  /** 初始化 SDK，绑定账户 */
+  init = async (_event, data: { userSig: string }): Promise<IResponse> => {
+    const initParam = {
+      port: 65535,
+      userSig: data.userSig
+    }
+
+    // 注册 Cookie 持久化回调
+    this.broSDK.registerCookiesStorageCb((cookies) => {
+      console.log('cookies:', cookies)
+      return null
+    })
+
+    const res = this.broSDK.init(JSON.stringify(initParam))
+    console.log('init result:', res)
+
+    if (res.code === 0) {
+      this.bindStatus = true
+      // 手动释放 SDK 分配的输出缓冲区
+      this.broSDK.freePointer(res.ptr)
+    }
+
+    return {
+      code: res.code,
+      msg: res.code === 0 ? 'Initialization successful.' : 'Initialization failed.'
+    }
+  }
+
+  /** 更新 Token */
+  tokenUpdate = async (_event, data: object): Promise<IResponse> => {
+    const code = this.broSDK.tokenUpdate(JSON.stringify(data))
+    return { code, msg: '' }
+  }
+
+  /** 打开浏览器环境 */
+  browserOpen = async (_event, data: object): Promise<IResponse> => {
+    console.log('启动环境', data)
+    const code = this.broSDK.browserOpen(JSON.stringify(data))
+    return { code, msg: '' }
+  }
+
+  /** 关闭浏览器环境 */
+  browserClose = async (_event, data: object): Promise<IResponse> => {
+    console.log('关闭环境', data)
+    const code = this.broSDK.browserClose(data)
+    return { code, msg: '' }
+  }
+
+  /** 关闭 SDK，释放所有资源 */
+  shutdown = async (_event): Promise<IResponse | void> => {
+    if (!this.bindStatus) return
+
+    const code = this.broSDK.shutdown()
+    if (code === 0) {
+      this.bindStatus = false
+    }
+    return { code, msg: '' }
+  }
+}
+```
+
+---
+
+## API 参考
+
+### 构造函数
+
+```typescript
+const sdk = new BroSDK()
+```
+
+自动根据当前平台（`process.platform`）和架构（`process.arch`）加载对应动态库。
+
+---
+
+### 初始化
+
+#### `init(json)`
+
+同步初始化 SDK。
+
+```typescript
+const res = sdk.init({ port: 65535, userSig: 'xxx' })
+// res: { code: number, ptr: unknown, len: number, response: string | null }
+sdk.freePointer(res.ptr)  // 使用完毕后必须释放
+```
+
+#### `initAsync(json): number`
+
+异步初始化，结果通过 `registerResultCb` 回调返回，返回值为请求 ID。
+
+```typescript
+const reqId = sdk.initAsync({ port: 65535, userSig: 'xxx' })
+```
+
+#### `initWebAPI(port): number`
+
+启动内置 Web API 服务。
+
+```typescript
+sdk.initWebAPI(8080)
+```
+
+---
+
+### 信息查询
+
+#### `sdkInfo()`
+
+获取 SDK 版本及基础信息。
+
+```typescript
+const info = sdk.sdkInfo()
+console.log(info.response)  // JSON 字符串
+sdk.freePointer(info.ptr)
+```
+
+#### `browserInfo()`
+
+获取内置浏览器信息。
+
+```typescript
+const info = sdk.browserInfo()
+console.log(info.response)
+sdk.freePointer(info.ptr)
+```
+
+---
+
+### 浏览器控制
+
+#### `browserOpen(json): number`
+
+打开浏览器环境。
+
+```typescript
+const code = sdk.browserOpen({ envId: 'env-001' })
+```
+
+#### `browserClose(json): number`
+
+关闭浏览器环境。
+
+```typescript
+const code = sdk.browserClose({ envId: 'env-001' })
+```
+
+---
+
+### 环境管理
+
+所有环境接口均返回 `{ code, ptr, len, response }`，调用后需 `freePointer(res.ptr)` 释放内存。
+
+#### `envCreate(json)`
+
+创建浏览器环境。
+
+```typescript
+const res = sdk.envCreate({ name: '测试环境', os: 'windows' })
+const env = JSON.parse(res.response ?? '{}')
+sdk.freePointer(res.ptr)
+```
+
+#### `envUpdate(json)`
+
+更新环境配置。
+
+```typescript
+const res = sdk.envUpdate({ envId: 'env-001', name: '新名称' })
+sdk.freePointer(res.ptr)
+```
+
+#### `envPage(json)`
+
+分页查询环境列表。
+
+```typescript
+const res = sdk.envPage({ page: 1, pageSize: 20 })
+const list = JSON.parse(res.response ?? '{}')
+sdk.freePointer(res.ptr)
+```
+
+#### `envDestroy(json)`
+
+删除环境。
+
+```typescript
+const res = sdk.envDestroy({ envId: 'env-001' })
+sdk.freePointer(res.ptr)
+```
+
+---
+
+### Token 管理
+
+#### `tokenUpdate(json): number`
+
+更新鉴权 Token。
+
+```typescript
+const code = sdk.tokenUpdate({ token: 'new-token' })
+```
+
+---
+
+### 生命周期
+
+#### `shutdown(): number`
+
+关闭 SDK，自动注销所有已注册回调，释放原生资源。
+
+```typescript
+const code = sdk.shutdown()
+```
+
+#### `freePointer(ptr): void`
+
+释放由 SDK 分配的内存（`init`、`sdkInfo`、`envCreate` 等有输出缓冲区的接口）。
+
+```typescript
+sdk.freePointer(res.ptr)
+```
+
+---
+
+### 回调注册
+
+#### `registerResultCb(fn)`
+
+注册全局结果回调，SDK 内部线程触发时，koffi 会将调用调度回 Node.js 主线程。
+
+```typescript
+sdk.registerResultCb((code: number, data: string) => {
+  if (sdk.isOk(code)) {
+    const payload = JSON.parse(data)
+    // 处理结果...
+  } else if (sdk.isEvent(code)) {
+    console.log('事件:', sdk.eventName(code), data)
+  } else if (sdk.isError(code)) {
+    console.error('错误:', sdk.errorString(code))
+  }
+})
+```
+
+#### `registerCookiesStorageCb(fn?)`
+
+注册 Cookie 持久化回调。`fn` 接收 Cookie 数据字符串，返回修改后的字符串或 `null`（透传）。
+
+```typescript
+sdk.registerCookiesStorageCb((cookies) => {
+  // 可将 cookies 持久化到本地文件/数据库
+  saveCookiesToDisk(cookies)
+  return null  // 不修改内容
+})
+```
+
+---
+
+## 错误码工具
+
+| 方法 | 说明 |
+|------|------|
+| `isOk(code)` | 是否成功 |
+| `isError(code)` | 是否错误 |
+| `isDone(code)` | 是否完成 |
+| `isWarn(code)` | 是否警告 |
+| `isReqid(code)` | 是否请求 ID |
+| `isEvent(code)` | 是否事件通知 |
+| `errorName(code)` | 返回错误名称字符串 |
+| `errorString(code)` | 返回错误描述字符串 |
+| `eventName(evtid)` | 返回事件名称字符串 |
+| `printErrno(tag, code)` | 格式化打印错误信息到控制台 |
+
+```typescript
+if (!sdk.isOk(code)) {
+  sdk.printErrno('browserOpen', code)
+  // 输出: [browserOpen] ERROR  code=-1001  (SDK_ERR_AUTH): Authentication failed
+}
+```
+
+---
+
+## 注意事项
+
+1. **内存管理**：所有返回 `{ ptr, len, response }` 的接口，在读取 `response` 之后必须调用 `sdk.freePointer(res.ptr)` 释放 SDK 分配的堆内存，否则会造成内存泄漏。
+
+2. **仅主进程**：`BroSDK` 依赖 `koffi` FFI 和 Electron `app` 模块，只能在 **Electron 主进程** 中实例化，不可在渲染进程或 Worker 中使用。
+
+3. **单例模式**：建议全局只创建一个 `BroSDK` 实例，并在应用退出前调用 `shutdown()`。
+
+4. **回调线程安全**：`registerResultCb` 注册的回调由 koffi 调度到主线程执行，可安全访问主进程状态，无需额外加锁。
+
+5. **打包配置**：使用 `electron-builder` 打包时，需将 `sdk/` 目录配置为 `extraResources`，确保动态库随包发布：
+
+   ```json
+   // electron-builder.config.json
+   {
+     "extraResources": [
+       { "from": "sdk", "to": "sdk" }
+     ]
+   }
+   ```
+
+---
+
+## License
+
+MIT
