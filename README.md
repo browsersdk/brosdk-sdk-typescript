@@ -12,8 +12,12 @@
 - [快速上手](#快速上手)
 - [在 Electron IPC 中使用](#在-electron-ipc-中使用)
 - [API 参考](#api-参考)
+- [Web API 接口（HTTP）](#web-api-接口http)
 - [错误码工具](#错误码工具)
 - [事件回调](#事件回调)
+- [附录](#附录)
+  - [附录 A · 错误码全表](#附录-a--错误码全表)
+  - [附录 B · 事件码全表](#附录-b--事件码全表)
 - [注意事项](#注意事项)
 
 ---
@@ -198,13 +202,15 @@ const sdk = new BroSDK()
 
 #### `init(json)`
 
-同步初始化 SDK。
+同步初始化 SDK。**初始化成功后，SDK 会启动一个 HTTP 服务，监听端口为初始化参数中指定的 `port`**。
 
 ```typescript
 const res = sdk.init({ port: 65535, userSig: 'xxx' })
 // res: { code: number, ptr: unknown, len: number, response: string | null }
 sdk.freePointer(res.ptr)  // 使用完毕后必须释放
 ```
+
+> **注意**：`port` 字段必须指定，SDK 将在此端口启动内嵌 HTTP 服务，提供 Web API 接口（详见下方 [Web API 接口](#web-api-接口http)）。
 
 #### `initAsync(json): number`
 
@@ -277,7 +283,7 @@ const code = sdk.browserClose({ envId: 'env-001' })
 创建浏览器环境。
 
 ```typescript
-const res = sdk.envCreate({ name: '测试环境', os: 'windows' })
+const res = sdk.envCreate({ envName: '测试环境'})
 const env = JSON.parse(res.response ?? '{}')
 sdk.freePointer(res.ptr)
 ```
@@ -287,7 +293,7 @@ sdk.freePointer(res.ptr)
 更新环境配置。
 
 ```typescript
-const res = sdk.envUpdate({ envId: 'env-001', name: '新名称' })
+const res = sdk.envUpdate({ envId: 'env-001', envName: '新名称' })
 sdk.freePointer(res.ptr)
 ```
 
@@ -377,53 +383,51 @@ sdk.registerCookiesStorageCb((cookies) => {
 
 ---
 
-## 错误码工具
+## Web API 接口（HTTP）
 
-| 方法 | 说明 |
-|------|------|
-| `isOk(code)` | 是否成功 |
-| `isError(code)` | 是否错误 |
-| `isDone(code)` | 是否完成 |
-| `isWarn(code)` | 是否警告 |
-| `isReqid(code)` | 是否请求 ID |
-| `isEvent(code)` | 是否事件通知 |
-| `errorName(code)` | 返回错误名称字符串 |
-| `errorString(code)` | 返回错误描述字符串 |
-| `eventName(evtid)` | 返回事件名称字符串 |
-| `printErrno(tag, code)` | 格式化打印错误信息到控制台 |
+> **前提**：需先在 `sdk_init` 请求 JSON 中指定 `port` 字段启动内嵌 HTTP 服务。
 
-```typescript
-if (!sdk.isOk(code)) {
-  sdk.printErrno('browserOpen', code)
-  // 输出: [browserOpen] ERROR  code=-1001  (SDK_ERR_AUTH): Authentication failed
+**通用请求头**：`Content-Type: application/json`  
+**Base URL**：`http://127.0.0.1:{port}`
+
+Web API 的请求/响应格式与 C API 完全一致。以下仅列出端点路径与简要说明。
+
+| 方法 | 路径 | 说明 | 对应 C API |
+|------|------|------|-----------|
+| `POST` | `/sdk/v1/init` | 初始化 SDK | `sdk_init` |
+| `POST` | `/sdk/v1/token/update` | 刷新令牌 | `sdk_token_update` |
+| `POST` | `/sdk/v1/browser/open` | 打开浏览器 | `sdk_browser_open` |
+| `POST` | `/sdk/v1/browser/close` | 关闭浏览器 | `sdk_browser_close` |
+| `POST` | `/sdk/v1/env/create` | 创建环境 | `sdk_env_create` |
+| `POST` | `/sdk/v1/env/update` | 更新环境 | `sdk_env_update` |
+| `POST` | `/sdk/v1/env/page` | 环境列表（分页） | `sdk_env_page` |
+| `POST` | `/sdk/v1/env/destroy` | 销毁环境 | `sdk_env_destroy` |
+| `POST` | `/sdk/v1/shutdown` | 停止 SDK | `sdk_shutdown` |
+
+**请求/响应示例**
+
+```http
+POST http://127.0.0.1:9527/sdk/v1/browser/open
+Content-Type: application/json
+
+{
+  "envs": [
+    {
+      "envId": 2028432501503954944,
+      "urls": ["https://www.example.com"]
+    }
+  ]
 }
 ```
 
----
-
-## 注意事项
-
-1. **内存管理**：所有返回 `{ ptr, len, response }` 的接口，在读取 `response` 之后必须调用 `sdk.freePointer(res.ptr)` 释放 SDK 分配的堆内存，否则会造成内存泄漏。
-
-2. **仅主进程**：`BroSDK` 依赖 `koffi` FFI 和 Electron `app` 模块，只能在 **Electron 主进程** 中实例化，不可在渲染进程或 Worker 中使用。
-
-3. **单例模式**：建议全局只创建一个 `BroSDK` 实例，并在应用退出前调用 `shutdown()`。
-
-4. **回调线程安全**：`registerResultCb` 注册的回调由 koffi 调度到主线程执行，可安全访问主进程状态，无需额外加锁。
-
-5. **打包配置**：使用 `electron-builder` 打包时，需将 `sdk/` 目录配置为 `extraResources`，确保动态库随包发布：
-
-   ```json
-   // electron-builder.config.json
-   {
-     "extraResources": [
-       { "from": "sdk", "to": "sdk" }
-     ]
-   }
-   ```
-
----
-
-## License
-
-MIT
+```json
+{
+  "reqid": 1006901417,
+  "code": 0,
+  "msg": "ok",
+  "result": {
+    "envId": 2028432501503954944,
+    "eventId": 20111
+  }
+}
+```
